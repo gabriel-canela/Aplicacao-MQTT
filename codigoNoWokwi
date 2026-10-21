@@ -1,0 +1,160 @@
+from machine import ADC, Pin
+import network
+import time
+import ntptime
+import ujson
+import ssl
+
+from umqtt.simple import MQTTClient
+
+# CONFIGURAÇÕES WI-FI
+
+WIFI_SSID = "Wokwi-GUEST"
+WIFI_PASS = ""
+
+# CONFIGURAÇÕES EMQX CLOUD
+
+MQTT_BROKER = "i66f1101.ala.us-east-1.emqxsl.com"
+MQTT_PORT = 8883
+
+MQTT_USER = "espteste"
+MQTT_PASS = "teste"
+
+MQTT_CLIENT_ID = "esp32_jardim_bot_7776"
+
+MQTT_TOPIC_PUB = "jardim/solo/status"
+MQTT_TOPIC_SUB = "jardim/irrigacao/comando"
+
+# HARDWARE
+
+sensor_solo = ADC(Pin(34))
+sensor_solo.atten(ADC.ATTN_11DB)
+
+bomba_irrigacao = Pin(2, Pin.OUT)
+
+# CONEXÃO WI-FI E SINCRONIZAÇÃO NTP
+
+def conectar_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+
+    print("Conectando ao Wi-Fi", end="")
+
+    while not wlan.isconnected():
+        print(".", end="")
+        time.sleep(0.5)
+
+    print("\nWi-Fi conectado!")
+
+    print("Sincronizando relógio via NTP...")
+
+    try:
+        ntptime.settime()
+        print("Relógio sincronizado com sucesso!")
+
+    except Exception as e:
+        print("Erro ao sincronizar NTP:", e)
+
+
+# CALLBACK MQTT
+
+def sub_cb(topic, msg):
+    print(f"Comando recebido: {msg}")
+
+    if msg == b"LIGAR":
+        bomba_irrigacao.value(1)
+        print("Bomba ligada!")
+
+    elif msg == b"DESLIGAR":
+        bomba_irrigacao.value(0)
+        print("Bomba desligada!")
+
+
+# CONEXÃO MQTT SEGURA (TLS)
+
+conectar_wifi()
+
+print("Carregando certificado CA...")
+
+try:
+    with open("emqx_ca.txt", "rb") as f:
+        ca_cert = f.read()
+
+    print("Certificado CA carregado com sucesso!")
+
+except Exception as e:
+    print("Erro ao ler o certificado CA:", e)
+    raise
+
+ssl_params = {
+    "cert_reqs": ssl.CERT_REQUIRED,
+    "cadata": ca_cert,
+    "server_hostname": MQTT_BROKER,
+}
+
+client = MQTTClient(
+    client_id=MQTT_CLIENT_ID,
+    server=MQTT_BROKER,
+    port=MQTT_PORT,
+    user=MQTT_USER,
+    password=MQTT_PASS,
+    keepalive=60,
+    ssl=True,
+    ssl_params=ssl_params,
+)
+
+client.set_callback(sub_cb)
+
+print("Conectando ao broker MQTT...")
+
+client.connect(clean_session=True)
+
+client.subscribe(MQTT_TOPIC_SUB)
+
+print("Conectado ao broker MQTT com TLS!")
+
+# MONITORAMENTO DO SOLO
+
+last_message = 0
+
+LIMITE_UMIDADE_MINIMA = 30.0
+
+try:
+    while True:
+
+        # Verifica mensagens recebidas
+        client.check_msg()
+
+        # Publica a cada 3 segundos
+        if time.time() - last_message >= 3:
+
+            leitura_raw = sensor_solo.read()
+
+            umidade_percentual = round(
+                (leitura_raw / 4095.0) * 100, 1
+            )
+
+            status_solo = (
+                "SECO"
+                if umidade_percentual < LIMITE_UMIDADE_MINIMA
+                else "UMIDO"
+            )
+
+            payload = ujson.dumps({
+                "umidade_solo": umidade_percentual,
+                "status": status_solo
+            })
+
+            client.publish(MQTT_TOPIC_PUB, payload)
+
+            print(f"Enviado: {payload}")
+
+            last_message = time.time()
+
+        time.sleep(0.1)
+
+except KeyboardInterrupt:
+    print("Encerrando conexão MQTT...")
+    client.disconnect()
